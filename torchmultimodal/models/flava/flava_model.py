@@ -185,9 +185,8 @@ def flava_model_for_pretraining(
     # TODO: Add parameters for loss here
 ):
     model = flava_model(**flava_model_kwargs)
-
-    codebook = DalleVAEEncoder(image_size=codebook_image_size)
     losses = FLAVAPretrainingLoss()
+    codebook = DalleVAEEncoder(image_size=codebook_image_size)
 
     flava = FLAVAForPreTraining(
         model=model,
@@ -212,7 +211,6 @@ def flava_model_for_classification(
     pretrained_model_key: Optional[str] = "flava_full",
     **flava_model_kwargs: Any,
 ):
-    model = flava_model(**flava_model_kwargs)
     classifier = MLP(
         in_dim=classifier_in_dim,
         out_dim=num_classes,
@@ -221,7 +219,7 @@ def flava_model_for_classification(
         activation=classifier_activation,
         normalization=classifier_normalization,
     )
-
+    model = flava_model(**flava_model_kwargs)
     if loss_fn is None:
         loss_fn = nn.CrossEntropyLoss()
 
