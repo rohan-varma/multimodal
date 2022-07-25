@@ -108,7 +108,7 @@ def main(i=-1, file_str=None):
 
     trainer = Trainer(
         **OmegaConf.to_container(config.training.lightning),
-        profiler=profiler,
+#        profiler=profiler,
         callbacks=callbacks,
     )
     ckpt_path = config.training.lightning_load_from_checkpoint
