@@ -75,6 +75,7 @@ def flava_multimodal_encoder(
     intermediate_activation: Callable[..., nn.Module] = nn.GELU,
     attention_probs_dropout_prob: float = 0.0,
     layer_norm_eps: float = 1e-12,
+    checkpoint_activations: bool = False,
 ) -> FLAVATransformerWithoutEmbeddings:
     encoder = FLAVATransformerEncoder(
         hidden_size=hidden_size,
@@ -85,6 +86,7 @@ def flava_multimodal_encoder(
         intermediate_activation=intermediate_activation,
         attention_probs_dropout_prob=attention_probs_dropout_prob,
         layer_norm_eps=layer_norm_eps,
+        checkpoint_activations=checkpoint_activations,
     )
     layernorm = Fp32LayerNorm(hidden_size, eps=layer_norm_eps)
     pooler = Pooler(hidden_size=hidden_size)
@@ -450,8 +452,12 @@ def flava_model(
     multimodal_intermediate_activation: Callable[..., nn.Module] = nn.GELU,
     multimodal_attention_probs_dropout_prob: float = 0.0,
     multimodal_layer_norm_eps: float = 1e-12,
+    # non-modality specific parameters
+    checkpoint_activations: bool = False,
     # projection
     text_and_image_proj_size: int = 768,
+
+
     **kwargs: Any,
 ) -> FLAVAModel:
     image_encoder = flava_image_encoder(
@@ -467,6 +473,7 @@ def flava_model(
         image_size=image_size,
         patch_size=patch_size,
         num_channels=num_channels,
+        checkpoint_activations=checkpoint_activations,
     )
 
     text_encoder = flava_text_encoder(
@@ -482,6 +489,7 @@ def flava_model(
         pad_token_id=pad_token_id,
         type_vocab_size=type_vocab_size,
         max_position_embeddings=max_position_embeddings,
+        checkpoint_activations=checkpoint_activations,
     )
     mm_encoder = flava_multimodal_encoder(
         hidden_size=multimodal_hidden_size,
@@ -492,6 +500,7 @@ def flava_model(
         intermediate_activation=multimodal_intermediate_activation,
         attention_probs_dropout_prob=multimodal_attention_probs_dropout_prob,
         layer_norm_eps=multimodal_layer_norm_eps,
+        checkpoint_activations=checkpoint_activations,
     )
 
     image_to_mm_projection = nn.Linear(image_hidden_size, multimodal_hidden_size)
@@ -518,7 +527,8 @@ def flava_model_for_pretraining(
     # TODO: Add parameters for loss here
 ) -> FLAVAForPreTraining:
     model = flava_model(**flava_model_kwargs)
-    losses = FLAVAPretrainingLoss()
+    hidden_size = flava_model_kwargs.get("multimodal_hidden_size", 768)
+    losses = FLAVAPretrainingLoss(hidden_size=hidden_size)
     codebook = DalleVAEEncoder(image_size=codebook_image_size)
 
     flava = FLAVAForPreTraining(

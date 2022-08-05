@@ -192,6 +192,7 @@ def flava_text_encoder(
     pad_token_id: int = 0,
     type_vocab_size: int = 2,
     max_position_embeddings: int = 512,
+    checkpoint_activations: bool = False,
 ) -> TextTransformer:
     embeddings = TextEmbeddings(
         hidden_size=hidden_size,
@@ -213,6 +214,7 @@ def flava_text_encoder(
         attention_probs_dropout_prob=attention_probs_dropout_prob,
         layer_norm_eps=layer_norm_eps,
         pad_token_id=pad_token_id,
+        checkpoint_activations=checkpoint_activations,
     )
 
     layernorm = Fp32LayerNorm(hidden_size, eps=layer_norm_eps)

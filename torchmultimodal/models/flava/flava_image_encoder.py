@@ -245,6 +245,7 @@ def flava_image_encoder(
     image_size: int = 224,
     patch_size: int = 16,
     num_channels: int = 3,
+    checkpoint_activations: bool = False,
 ) -> ImageTransformer:
 
     embeddings = ImageEmbeddings(
@@ -264,6 +265,7 @@ def flava_image_encoder(
         intermediate_activation=intermediate_activation,
         attention_probs_dropout_prob=attention_probs_dropout_prob,
         layer_norm_eps=layer_norm_eps,
+        checkpoint_activations=checkpoint_activations,
     )
 
     layernorm = Fp32LayerNorm(hidden_size, eps=layer_norm_eps)

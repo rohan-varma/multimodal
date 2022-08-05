@@ -15,6 +15,7 @@ import torch
 from torch import nn, Tensor
 from torchmultimodal.modules.layers.attention import MultiHeadAttention, SelfAttention
 from torchmultimodal.modules.layers.mlp import MLP
+from torch.utils.checkpoint import checkpoint
 
 FLAVATransformerOutput = namedtuple(
     "FLAVATransformerOutput",
@@ -352,9 +353,11 @@ class FLAVATransformerEncoder(nn.Module):
         intermediate_size: int = 3072,
         intermediate_activation: Callable[..., nn.Module] = nn.GELU,
         layer_norm_eps: float = 1e-12,
+        checkpoint_activations: bool = False,
         **kwargs: Any,
     ):
         super().__init__()
+        self.checkpoint_activations = checkpoint_activations
         self.layer = nn.ModuleList(
             [
                 TransformerEncoderLayer(
@@ -366,6 +369,7 @@ class FLAVATransformerEncoder(nn.Module):
                     layer_norm_eps=layer_norm_eps,
                     norm_first=True,
                 )
+
                 for _ in range(num_hidden_layers)
             ]
         )
@@ -384,12 +388,21 @@ class FLAVATransformerEncoder(nn.Module):
             all_hidden_states.append(hidden_states)
 
             layer_head_mask = head_mask[i] if head_mask is not None else None
-            layer_outputs = layer_module(
-                hidden_states,
-                attention_mask=attention_mask,
-                head_mask=layer_head_mask,
-                return_attn_weights=True,
-            )
+            if self.checkpoint_activations:
+                layer_outputs = checkpoint(
+                    layer_module,
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    head_mask=layer_head_mask,
+                    return_attn_weights=True,
+                )
+            else:
+                layer_outputs = layer_module(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    head_mask=layer_head_mask,
+                    return_attn_weights=True,
+                )
 
             hidden_states = layer_outputs[0]
 
