@@ -60,7 +60,10 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
 
 
-def setup_distributed_device() -> None:
+def setup_distributed_device() -> torch.device:
+    if not torch.cuda.is_available() or not dist.is_available():
+        return torch.device("cpu")
+
     dist.init_process_group("nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     print("local rank", local_rank)

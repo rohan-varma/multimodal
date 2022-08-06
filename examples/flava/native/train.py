@@ -6,19 +6,23 @@
 
 # train using `torchrun --master_port=1256 --nproc_per_node=4 -m flava.native.train config=flava/configs/pretraining/debug.yaml`
 
-import os
-import sys
 
 import time
-from contextlib import nullcontext
 from functools import partial
-from typing import Any, Dict, Union
-from torchmultimodal.modules.layers.transformer import TransformerEncoderLayer
+from typing import Any, Dict, Tuple, Union
+
 import datasets
 import torch
 import torch.distributed as dist
 from common.data import MultiDataModule
-from flava.data import ImageDataModule, MLMDataModule, VLDataModule
+from flava.callbacks.multimodal_eval import run_imagenet_zero_shot
+from flava.data import (
+    default_text_transform,
+    ImageDataModule,
+    MLMDataModule,
+    VL_MAX_LENGTH_DEFAULT,
+    VLDataModule,
+)
 from flava.definitions import FLAVAArguments
 from flava.native.model import FLAVAPreTrainModule, get_optimizer
 from flava.native.utils import (
@@ -43,10 +47,11 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
+from torchmultimodal.modules.layers.transformer import TransformerEncoderLayer
 from torchmultimodal.modules.losses.flava import FLAVAPretrainingLossOutput
 
 
-def get_datamodules(config: FLAVAArguments) -> MultiDataModule:
+def get_datamodules(config: FLAVAArguments) -> Tuple[MultiDataModule, ImageDataModule]:
     datamodules = []
 
     # also needed for the imagenet eval callback
@@ -71,7 +76,7 @@ def get_datamodules(config: FLAVAArguments) -> MultiDataModule:
         else:
             raise ValueError(f"unknown dataset: {dataset}")
 
-    return MultiDataModule(datamodules)
+    return MultiDataModule(datamodules), imagenet_datamodule
 
 
 @record
@@ -89,8 +94,22 @@ class Trainer:
         self.steps: int = -1
         self.epochs: int = -1
 
-        self.datamodule: MultiDataModule = get_datamodules(config)
+        multi_module, image_module = get_datamodules(config)
+
+        self.datamodule: MultiDataModule = multi_module
         self.datamodule.setup("fit")
+
+        self.imagenet_val_dataloader = image_module.val_dataloader()
+        self.imagenet_val_text_transform = default_text_transform(
+            max_text_length=VL_MAX_LENGTH_DEFAULT
+        )
+
+        self.half_dtype = (
+            torch.bfloat16
+            if config.training.half_precision_format == "bfloat16"
+            else torch.float16
+        )
+
         self.scaler = (
             torch.cuda.amp.GradScaler() if config.training.enable_amp else None
         )
@@ -120,7 +139,7 @@ class Trainer:
         )
 
         model = model.to(self.device)
-        print0(f"move model to cuda: {torch.cuda.memory_allocated()/1024**3:.3} GB")
+        print0(f"after moving to cuda: {torch.cuda.memory_allocated()/1024**3:.3} GB")
         if strategy == "ddp":
             # TODO do we have to do this in FSDP too? see https://github.com/pytorch/pytorch/issues/75478
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -132,13 +151,14 @@ class Trainer:
             )
             print0(f"after DDP: {torch.cuda.memory_allocated()/1024**3:.3} GB")
         elif strategy == "fsdp":
+            mp = None
+            if self.config.training.enable_half_reduce:
+                mp = MixedPrecision(
+                    reduce_dtype=self.half_dtype,
+                )
             model = FSDP(
                 model,
-                mixed_precision=MixedPrecision(
-                    # param_dtype=torch.bfloat16  doesn't work
-                   reduce_dtype=torch.bfloat16,
-                    # buffer_dtype=torch.bfloat16, checkpoint not supported
-                ),
+                mixed_precision=mp,
                 auto_wrap_policy=partial(
                     transformer_auto_wrap_policy,
                     transformer_layer_cls={TransformerEncoderLayer},
@@ -190,13 +210,7 @@ class Trainer:
 
         optimizer, scheduler = get_optimizer(
             model,
-            learning_rate=self.config.training.get("learning_rate"),
-            adam_eps=self.config.training.get("adam_eps"),
-            adam_weight_decay=self.config.training.get("adam_weight_decay"),
-            adam_betas=self.config.training.get("adam_betas"),
-            warmup_steps=self.config.training.get("warmup_steps"),
-            max_steps=self.config.training.get("max_steps"),
-            use_bf16=self.config.training.get("enable_bf16"),
+            **self.config.training.optimizer,
         )
 
         while True:
@@ -219,8 +233,8 @@ class Trainer:
                 optimizer.zero_grad(set_to_none=True)
 
                 with torch.cuda.amp.autocast(
-                    dtype=torch.bfloat16
-                ) if self.scaler else nullcontext():
+                    dtype=self.half_dtype, enabled=bool(self.scaler)
+                ):
                     output = model(data)
                     print0(
                         f"after forward pass {torch.cuda.memory_allocated()/1024**3:.3} GB"
@@ -280,29 +294,48 @@ class Trainer:
             return
 
         model = self.model
-
-        print0("evaluating")
         model.eval()
+        print0("evaluating")
+
         validation_loader = self.datamodule.val_dataloader()
         validation_loss = torch.Tensor([0]).to(self.device)
-        for i, data in enumerate(validation_loader):
-            # quick hack to make validation faster
-            if i == 20:
-                break
+
+        for data in validation_loader:
             data = self.preprocess_data(data)
             with torch.no_grad():
                 with torch.cuda.amp.autocast(
-                    dtype=torch.bfloat16
-                ) if self.scaler else nullcontext():
+                    dtype=self.half_dtype, enabled=bool(self.scaler)
+                ):
                     output = model(data)
                     total_loss = self.calculate_loss(output, validation=True)
                     validation_loss += total_loss.detach()
 
-        print0(validation_loss)
         dist.reduce(validation_loss, dst=0)
         norm_validation_loss = validation_loss.item() / dist.get_world_size()
+
         print0(f"step {self.steps} EVAL loss: {norm_validation_loss:.4}")
         self.log("validation/loss", norm_validation_loss, always_log=True)
+
+    def imagenet_validate(self):
+        # not working due to FSDP issue
+        print0("imagenet validation")
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(
+                dtype=self.half_dtype, enabled=bool(self.scalar)
+            ):
+                metrics = run_imagenet_zero_shot(
+                    self.model,
+                    self.imagenet_val_dataloader,
+                    self.device,
+                    self.imagenet_val_text_transform,
+                )
+                if metrics is not None:
+                    for key in metrics:
+                        self.log(
+                            f"val/{key}",
+                            metrics[key],
+                            always_log=True,
+                        )
 
 
 if __name__ == "__main__":

@@ -456,8 +456,6 @@ def flava_model(
     checkpoint_activations: bool = False,
     # projection
     text_and_image_proj_size: int = 768,
-
-
     **kwargs: Any,
 ) -> FLAVAModel:
     image_encoder = flava_image_encoder(

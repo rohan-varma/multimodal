@@ -27,7 +27,7 @@ def _zero_shot_classifier(model, device, text_transform, *args, **kwargs):
             [template(classname) for template in openai_imagenet_template]
         )["input_ids"]
         texts = texts.to(device)
-        class_embeddings = model.encode_text(texts)
+        class_embeddings = model({"encode_text": texts})
         class_embeddings /= class_embeddings.norm(dim=-1, keepdim=True)
         class_embedding = class_embeddings.mean(dim=0)
         class_embedding /= class_embedding.norm()

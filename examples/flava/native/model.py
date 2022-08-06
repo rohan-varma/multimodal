@@ -8,7 +8,6 @@ from typing import Any, Tuple
 
 import torch
 from torch import nn
-from torch.utils.checkpoint import checkpoint
 from torchmetrics import Accuracy
 from torchmultimodal.models.flava.flava_model import (
     flava_model_for_classification,
@@ -25,40 +24,20 @@ def get_optimizer(
     adam_betas: Tuple[int, int] = (0.9, 0.999),
     warmup_steps: int = 2000,
     max_steps: int = 450000,
-    use_bf16: bool = True,
 ):
-    if use_bf16:
-        print("using bf16")
-        optimizer = BFOptimizer(
-            model.parameters(),
-            lr=learning_rate,
-            betas=adam_betas,
-            eps=adam_eps,
-            weight_decay=adam_weight_decay,
-        )
-    else:
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=learning_rate,
-            betas=adam_betas,
-            eps=adam_eps,
-            weight_decay=adam_weight_decay,
-        )
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        betas=adam_betas,
+        eps=adam_eps,
+        weight_decay=adam_weight_decay,
+    )
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
         num_training_steps=max_steps,
     )
     return optimizer, scheduler
-
-
-def get_batch_value(batch, key, use_bf16=True):
-    val = batch.get(key, None)
-    if val is None:
-        return
-    if val.dtype == torch.float32 and use_bf16:
-        return val.to(dtype=torch.bfloat16)
-    return val
 
 
 class FLAVAPreTrainModule(nn.Module):
@@ -72,6 +51,10 @@ class FLAVAPreTrainModule(nn.Module):
         self.use_bf16 = use_bf16
 
     def forward(self, batch):
+        # super hacky
+        if "encode_text" in batch:
+            return self.model.encode_text(*batch["encode_text"])
+
         if "image" in batch and ("text" in batch or "text_masked" in batch):
             required_embedding = "mm"
         elif "image" in batch:
@@ -82,20 +65,19 @@ class FLAVAPreTrainModule(nn.Module):
             raise RuntimeError("Batch needs to have either or both 'image' and 'text'.")
 
         output = self.model(
-            image=get_batch_value(batch, "image", self.use_bf16),
-            image_for_codebook=get_batch_value(
-                batch, "image_for_codebook", self.use_bf16
-            ),
-            image_patches_mask=get_batch_value(
-                batch, "image_patches_mask", self.use_bf16
-            ),
-            text=get_batch_value(batch, "text", self.use_bf16),
-            text_masked=get_batch_value(batch, "text_masked", self.use_bf16),
-            mlm_labels=get_batch_value(batch, "mlm_labels", self.use_bf16),
-            itm_labels=get_batch_value(batch, "itm_labels", self.use_bf16),
+            image=batch.get("image"),
+            image_for_codebook=batch.get("image_for_codebook"),
+            image_patches_mask=batch.get("image_patches_mask"),
+            text=batch.get("text"),
+            text_masked=batch.get("text_masked"),
+            mlm_labels=batch.get("mlm_labels"),
+            itm_labels=batch.get("itm_labels"),
             required_embedding=required_embedding,
         )
         return output
+
+    def encode_text(self, *args, **kwargs):
+        return self.model.encode_text(*args, **kwargs)
 
 
 class FLAVAClassificationModel(nn.Module):
@@ -110,7 +92,7 @@ class FLAVAClassificationModel(nn.Module):
         )
         self.metrics = Accuracy()
 
-    def forward(self, batch, batch_idx):
+    def forward(self, batch):
         if "image" in batch and ("text" in batch or "text_masked" in batch):
             required_embedding = "mm"
         elif "image" in batch:
