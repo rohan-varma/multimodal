@@ -38,12 +38,18 @@ from flava.native.utils import (
 from flava.utils import build_datamodule_kwargs
 
 from omegaconf import DictConfig, OmegaConf
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    apply_activation_checkpointing_wrapper,
+    checkpoint_wrapper,
+    CheckpointImpl,
+)
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.fsdp import (
     CPUOffload,
     FullyShardedDataParallel as FSDP,
     MixedPrecision,
 )
+from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
@@ -110,9 +116,7 @@ class Trainer:
             else torch.float16
         )
 
-        self.scaler = (
-            torch.cuda.amp.GradScaler() if config.training.enable_amp else None
-        )
+        self.scaler = ShardedGradScaler() if config.training.enable_amp else None
 
     def log(
         self,
@@ -152,10 +156,13 @@ class Trainer:
             print0(f"after DDP: {torch.cuda.memory_allocated()/1024**3:.3} GB")
         elif strategy == "fsdp":
             mp = None
-            if self.config.training.enable_half_reduce:
+            if self.config.training.enable_half_reduce_in_fsdp:
                 mp = MixedPrecision(
+                    # param_dtype=self.half_dtype,  not working
                     reduce_dtype=self.half_dtype,
+                    # buffer_dtype=self.half_dtype,
                 )
+
             model = FSDP(
                 model,
                 mixed_precision=mp,
@@ -164,6 +171,22 @@ class Trainer:
                     transformer_layer_cls={TransformerEncoderLayer},
                 ),
             )
+
+            if self.config.training.activation_checkpointing:
+                check_fn = lambda submodule: isinstance(
+                    submodule, TransformerEncoderLayer
+                )
+                non_reentrant_wrapper = partial(
+                    checkpoint_wrapper,
+                    offload_to_cpu=False,
+                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                )
+                apply_activation_checkpointing_wrapper(
+                    model,
+                    checkpoint_wrapper_fn=non_reentrant_wrapper,
+                    check_fn=check_fn,
+                )
+
             print0(f"after FSDP {torch.cuda.memory_allocated()/1024**3:.3} GB")
 
         else:
@@ -191,10 +214,10 @@ class Trainer:
                     mode = "validation"
                 else:
                     mode = "train"
-                    self.log(
-                        f"{mode}/losses/{key}",
-                        loss_reduce.item() / dist.get_world_size(),
-                    )
+                self.log(
+                    f"{mode}/losses/{key}",
+                    loss_reduce.item() / dist.get_world_size(),
+                )
 
         return total_loss
 
@@ -236,19 +259,19 @@ class Trainer:
                     dtype=self.half_dtype, enabled=bool(self.scaler)
                 ):
                     output = model(data)
-                    print0(
-                        f"after forward pass {torch.cuda.memory_allocated()/1024**3:.3} GB"
-                    )
-                    self.log(
-                        "stats/fwd memory alloc",
-                        torch.cuda.memory_allocated() / 1024**3,
-                    )
-                    self.log(
-                        "stats/fwd memory reserved",
-                        torch.cuda.memory_reserved() / 1024**3,
-                    )
+                print0(
+                    f"after forward pass {torch.cuda.memory_allocated()/1024**3:.3} GB"
+                )
+                self.log(
+                    "stats/fwd memory alloc",
+                    torch.cuda.memory_allocated() / 1024**3,
+                )
+                self.log(
+                    "stats/fwd memory reserved",
+                    torch.cuda.memory_reserved() / 1024**3,
+                )
 
-                    total_loss = self.calculate_loss(output)
+                total_loss = self.calculate_loss(output)
 
                 if self.scaler:
                     self.scaler.scale(total_loss).backward()

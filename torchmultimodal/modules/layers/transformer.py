@@ -387,22 +387,22 @@ class FLAVATransformerEncoder(nn.Module):
             all_hidden_states.append(hidden_states)
 
             layer_head_mask = head_mask[i] if head_mask is not None else None
-            if self.checkpoint_activations:
+            # if self.checkpoint_activations:
                 # checkpointing doesn't allow kwargs
-                layer_outputs = checkpoint(
-                    layer_module,
-                    hidden_states,
-                    attention_mask,
-                    layer_head_mask,
-                    True,  # return_attn_weights
-                )
-            else:
-                layer_outputs = layer_module(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    head_mask=layer_head_mask,
-                    return_attn_weights=True,
-                )
+            layer_outputs = checkpoint(
+                layer_module,
+                hidden_states,
+                attention_mask,
+                layer_head_mask,
+                True,  # return_attn_weights
+            )
+            # else:
+            # layer_outputs = layer_module(
+            #     hidden_states,
+            #     attention_mask=attention_mask,
+            #     head_mask=layer_head_mask,
+            #     return_attn_weights=True,
+            # )
 
             hidden_states = layer_outputs[0]
 
