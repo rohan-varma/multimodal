@@ -6,12 +6,16 @@
 
 import hashlib
 import os
+import warnings
 from collections import OrderedDict
+from copy import deepcopy
 from dataclasses import fields
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn, Tensor
+from torch.utils.checkpoint import checkpoint
+from torchmultimodal import _PATH_MANAGER
 
 
 def get_current_device() -> Union[str, torch.device]:
@@ -19,32 +23,6 @@ def get_current_device() -> Union[str, torch.device]:
         return f"cuda:{torch.cuda.current_device()}"
     else:
         return torch.device("cpu")
-
-
-def get_extended_attention_mask(attention_mask: Tensor) -> Tensor:
-    """
-    Makes broadcastable attention and causal masks so that future and masked tokens are ignored.
-
-    Args:
-        attention_mask (Tensor): Mask with ones indicating tokens to attend to, zeros for tokens to ignore.
-    Returns:
-        extended_attention_mask (Tensor): extended attention mask with the same dtype as attention_mask.dtype.
-    """
-
-    if attention_mask.dim() == 3:
-        extended_attention_mask = attention_mask[:, None, :, :]
-    elif attention_mask.dim() == 2:
-        extended_attention_mask = attention_mask[:, None, None, :]
-    else:
-        raise ValueError(
-            "Wrong shape for attention_mask (shape {})".format(attention_mask.shape)
-        )
-
-    extended_attention_mask = extended_attention_mask.to(
-        dtype=attention_mask.dtype
-    )  # fp16 compatibility
-
-    return extended_attention_mask
 
 
 def shift_dim(
@@ -121,26 +99,15 @@ def tensor_slice(x: Tensor, begin: List[int], size: List[int]) -> Tensor:
     return x[slices]
 
 
-def transpose_for_scores(
-    num_attention_heads: int, attention_head_size: int, x: Tensor
-) -> Tensor:
-    x = x.unflatten(-1, (num_attention_heads, attention_head_size))
-    return x.permute(0, 2, 1, 3)
-
-
 def load_module_from_url(
-    model: torch.nn.Module, url: str, progress: bool = True
+    model: torch.nn.Module, url: str, strict: bool = True, progress: bool = True
 ) -> None:
-    model_dir = os.path.join(
-        torch.hub.get_dir(),
-        "multimodal",
-        hashlib.sha256(url.encode("utf-8")).hexdigest(),
-    )
-
-    state_dict = torch.hub.load_state_dict_from_url(
-        url, model_dir=model_dir, progress=progress
-    )
-    model.load_state_dict(state_dict)
+    local_path = _PATH_MANAGER.get_local_path(url)
+    if not torch.cuda.is_available():
+        state_dict = torch.load(local_path, map_location=torch.device("cpu"))
+    else:
+        state_dict = torch.load(local_path)
+    model.load_state_dict(state_dict, strict=strict)
 
 
 @torch.no_grad()
@@ -219,3 +186,38 @@ def to_tuple_tuple(
     if isinstance(param, tuple):
         param_fixed = (param,) * num_tuple
     return param_fixed
+
+
+def checkpoint_wrapper(fn: Callable) -> Callable:
+    """Decorator to render an nn.Module instance method in checkpointing mode to save memory for training"""
+
+    def inner(cls: nn.Module, *inputs: Any, **kwargs: Any) -> Tensor:
+        if cls.training:
+            # By default the checkpoint API stashes and restores the RNG state during each checkpointed
+            # segment such that checkpointed passes making use of RNG (e.g., through dropout, batch norm)
+            # have deterministic outputs as compared to non-checkpointed passes. This can incur a moderate
+            # performance hit which we mitigate by checkpointing either before and after the layer that
+            # requires RNG.
+            if "use_cache" in kwargs and kwargs["use_cache"] is True:
+                warnings.warn(
+                    "Using `cache` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                )
+                kwargs["use_cache"] = False
+
+            def create_custom_forward(fn: Callable) -> Callable:
+                # checkpoint API does not accept user defined kwargs so we need to hide them
+                def custom_forward(*inputs: Any) -> Callable:
+                    return fn(cls, *inputs, **kwargs)
+
+                return custom_forward
+
+            return checkpoint(create_custom_forward(fn), *inputs)
+
+        else:
+            return fn(cls, *inputs, **kwargs)
+
+    return inner
+
+
+def get_clones(module: nn.Module, n: int) -> nn.ModuleList:
+    return nn.ModuleList([deepcopy(module) for i in range(n)])

@@ -37,8 +37,17 @@ EMBEDDING_OPTIONS = Literal["image", "text", "mm"]
 
 FLAVAOutput = namedtuple(
     "FLAVAOutput",
-    ["image", "image_masked", "text", "text_masked", "multimodal", "multimodal_masked"],
-    defaults=(None, None, None, None, None, None),
+    [
+        "image",
+        "image_masked",
+        "text",
+        "text_masked",
+        "multimodal",
+        "multimodal_masked",
+        "projected_image_embeddings",
+        "projected_text_embeddings",
+    ],
+    defaults=(None, None, None, None, None, None, None, None),
 )
 FLAVAOutput.__annotations__ = {
     "image": FLAVATransformerOutput,
@@ -51,7 +60,9 @@ FLAVAOutput.__annotations__ = {
 
 
 FLAVA_FOR_PRETRAINED_MAPPING = {
-    "flava_full": "https://huggingface.co/aps/flava_full_pretrained_encoders_torchmm/resolve/main/pytorch_model.bin",
+    # This will no longer load with the updated model, but keeping here just in case
+    # "flava_full": "https://huggingface.co/aps/flava_full_pretrained_encoders_torchmm/resolve/main/pytorch_model.bin",
+    "flava_full": "https://download.pytorch.org/models/multimodal/flava/flava_for_pretraining_unified.pt",
 }
 
 
@@ -61,9 +72,10 @@ def flava_multimodal_encoder(
     num_hidden_layers: int = 12,
     hidden_dropout_prob: float = 0.0,
     intermediate_size: int = 3072,
-    intermediate_activation: Callable[..., Tensor] = nn.functional.gelu,
+    intermediate_activation: Callable[..., nn.Module] = nn.GELU,
     attention_probs_dropout_prob: float = 0.0,
     layer_norm_eps: float = 1e-12,
+    checkpoint_activations: bool = False,
 ) -> FLAVATransformerWithoutEmbeddings:
     encoder = FLAVATransformerEncoder(
         hidden_size=hidden_size,
@@ -74,6 +86,7 @@ def flava_multimodal_encoder(
         intermediate_activation=intermediate_activation,
         attention_probs_dropout_prob=attention_probs_dropout_prob,
         layer_norm_eps=layer_norm_eps,
+        checkpoint_activations=checkpoint_activations,
     )
     layernorm = Fp32LayerNorm(hidden_size, eps=layer_norm_eps)
     pooler = Pooler(hidden_size=hidden_size)
@@ -99,6 +112,8 @@ class FLAVAModel(nn.Module, PretrainedMixin):
         mm_encoder: nn.Module,
         image_to_mm_projection: nn.Module,
         text_to_mm_projection: nn.Module,
+        text_projection: nn.Module,
+        image_projection: nn.Module,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -107,6 +122,8 @@ class FLAVAModel(nn.Module, PretrainedMixin):
         self.mm_encoder = mm_encoder
         self.image_to_mm_projection = image_to_mm_projection
         self.text_to_mm_projection = text_to_mm_projection
+        self.text_projection = text_projection
+        self.image_projection = image_projection
 
     def forward(
         self,
@@ -125,30 +142,50 @@ class FLAVAModel(nn.Module, PretrainedMixin):
             else:
                 required_embedding = "text"
 
-        image_outputs = self._encode_data_to_embeddings(
+        image_encoding_out = self._encode_data_to_embeddings(
             image,
             required_embedding,
             ["image", "mm"],
-            self.encode_image,
+            partial(self.encode_image, projection=True),
         )
-        text_outputs = self._encode_data_to_embeddings(
+        if len(image_encoding_out) == 2:
+            image_outputs, projected_image_embeddings = (
+                image_encoding_out[0],
+                image_encoding_out[1],
+            )
+        else:
+            image_outputs = image_encoding_out
+            projected_image_embeddings = None
+
+        text_encoding_out = self._encode_data_to_embeddings(
             text,
             required_embedding,
             ["text", "mm"],
-            self.encode_text,
+            partial(self.encode_text, projection=True),
         )
+        if len(text_encoding_out) == 2:
+            text_outputs, projected_text_embeddings = (
+                text_encoding_out[0],
+                text_encoding_out[1],
+            )
+        else:
+            text_outputs = text_encoding_out
+            projected_text_embeddings = None
+
         image_masked_outputs = self._encode_data_to_embeddings(
             image,
             required_embedding,
             ["image", "mm"],
             partial(self.encode_image, image_patches_mask=image_patches_mask),
         )
+        assert type(image_masked_outputs) == FLAVATransformerOutput
         text_masked_outputs = self._encode_data_to_embeddings(
             text_masked,
             required_embedding,
             ["text", "mm"],
             self.encode_text,
         )
+        assert type(text_masked_outputs) == FLAVATransformerOutput
 
         multimodal_outputs = FLAVATransformerOutput()
         multimodal_masked_outputs = FLAVATransformerOutput()
@@ -182,39 +219,60 @@ class FLAVAModel(nn.Module, PretrainedMixin):
             text_masked=text_masked_outputs,
             multimodal=multimodal_outputs,
             multimodal_masked=multimodal_masked_outputs,
+            projected_image_embeddings=projected_image_embeddings,
+            projected_text_embeddings=projected_text_embeddings,
         )
 
     def encode_image(
-        self, image: Tensor, image_patches_mask: Optional[Tensor] = None
-    ) -> Optional[FLAVATransformerOutput]:
+        self,
+        image: Tensor,
+        image_patches_mask: Optional[Tensor] = None,
+        projection: bool = False,
+    ) -> Union[Tuple[FLAVATransformerOutput, Tensor], Optional[FLAVATransformerOutput]]:
         if image_patches_mask is not None:
-            return self.image_encoder(image, image_patches_mask)
+            encoded_image = self.image_encoder(image, image_patches_mask)
         else:
-            return self.image_encoder(image)
+            encoded_image = self.image_encoder(image)
+        if projection:
+            projected_embeddings = self.image_projection(
+                encoded_image.last_hidden_state[:, 0, :]
+            )
+            return encoded_image, projected_embeddings
+        return encoded_image
 
     def encode_text(
-        self,
-        text: Tensor,
-        text_mask: Optional[Tensor] = None,
-    ) -> Optional[FLAVATransformerOutput]:
+        self, text: Tensor, text_mask: Optional[Tensor] = None, projection: bool = False
+    ) -> Union[Tuple[FLAVATransformerOutput, Tensor], Optional[FLAVATransformerOutput]]:
         # TODO(asg): Give proper parameter names when implementing text encoder
-        return self.text_encoder(
+        encoded_text = self.text_encoder(
             input_ids=text,
             attention_mask=text_mask,
         )
+        if projection:
+            projected_embeddings = self.text_projection(
+                encoded_text.last_hidden_state[:, 0, :]
+            )
+            return encoded_text, projected_embeddings
+        return encoded_text
 
     def _encode_data_to_embeddings(
         self,
         data: Optional[Tensor],
         selected_head_encoder: EMBEDDING_OPTIONS,
         encoder_options: List[EMBEDDING_OPTIONS],
-        encode_callable: Callable[..., FLAVATransformerOutput],
-    ) -> Optional[FLAVATransformerOutput]:
-        output = FLAVATransformerOutput()
+        encode_callable: Callable[
+            ...,
+            Union[
+                Tuple[FLAVATransformerOutput, Tensor], Optional[FLAVATransformerOutput]
+            ],
+        ],
+    ) -> Union[Tuple[FLAVATransformerOutput, Tensor], Optional[FLAVATransformerOutput]]:
+        output: Union[
+            Tuple[FLAVATransformerOutput, Tensor], FLAVATransformerOutput
+        ] = FLAVATransformerOutput()
 
         if data is not None and selected_head_encoder in encoder_options:
             output = encode_callable(data)
-
         return output
 
     def encode_mm(
@@ -251,9 +309,9 @@ class FLAVAForPreTraining(nn.Module, PretrainedMixin):
         image: Tensor,
         cls_index: int = 0,
     ) -> Tensor:
-        transformer_output = self.model.encode_image(image)
-        embeddings = transformer_output.last_hidden_state
-        return self.loss.contrastive_loss.image_projection(embeddings[:, cls_index, :])
+        encoded_result = self.model.encode_image(image, projection=True)
+        encoded_image = encoded_result[1]
+        return encoded_image
 
     def encode_text(
         self,
@@ -261,9 +319,9 @@ class FLAVAForPreTraining(nn.Module, PretrainedMixin):
         text_mask: Optional[Tensor] = None,
         cls_index: int = 0,
     ) -> Tensor:
-        transformer_output = self.model.encode_text(text, text_mask)
-        embeddings = transformer_output.last_hidden_state
-        return self.loss.contrastive_loss.text_projection(embeddings[:, cls_index, :])
+        encoded_result = self.model.encode_text(text, text_mask, projection=True)
+        encoded_text = encoded_result[1]
+        return encoded_text
 
     # TODO: Add options to enable losses selectively
     def forward(
@@ -305,6 +363,8 @@ class FLAVAForPreTraining(nn.Module, PretrainedMixin):
             itm_labels=itm_labels,
             mim_labels=image_labels,
             mlm_labels=mlm_labels,
+            projected_image_embeddings=flava_output.projected_image_embeddings,
+            projected_text_embeddings=flava_output.projected_text_embeddings,
         )
 
 
@@ -363,7 +423,7 @@ def flava_model(
     image_num_hidden_layers: int = 12,
     image_hidden_dropout_prob: float = 0.0,
     image_intermediate_size: int = 3072,
-    image_intermediate_activation: Callable[..., Tensor] = nn.functional.gelu,
+    image_intermediate_activation: Callable[..., nn.Module] = nn.GELU,
     image_attention_probs_dropout_prob: float = 0.0,
     image_layer_norm_eps: float = 1e-12,
     use_image_masking: bool = True,
@@ -376,7 +436,7 @@ def flava_model(
     text_num_hidden_layers: int = 12,
     text_hidden_dropout_prob: float = 0.0,
     text_intermediate_size: int = 3072,
-    text_intermediate_activation: Callable[..., Tensor] = nn.functional.gelu,
+    text_intermediate_activation: Callable[..., nn.Module] = nn.GELU,
     text_attention_probs_dropout_prob: float = 0.0,
     text_layer_norm_eps: float = 1e-12,
     vocab_size: int = 30522,
@@ -389,9 +449,13 @@ def flava_model(
     multimodal_num_hidden_layers: int = 6,
     multimodal_hidden_dropout_prob: float = 0.0,
     multimodal_intermediate_size: int = 3072,
-    multimodal_intermediate_activation: Callable[..., Tensor] = nn.functional.gelu,
+    multimodal_intermediate_activation: Callable[..., nn.Module] = nn.GELU,
     multimodal_attention_probs_dropout_prob: float = 0.0,
     multimodal_layer_norm_eps: float = 1e-12,
+    # non-modality specific parameters
+    checkpoint_activations: bool = False,
+    # projection
+    text_and_image_proj_size: int = 768,
     **kwargs: Any,
 ) -> FLAVAModel:
     image_encoder = flava_image_encoder(
@@ -407,6 +471,7 @@ def flava_model(
         image_size=image_size,
         patch_size=patch_size,
         num_channels=num_channels,
+        checkpoint_activations=checkpoint_activations,
     )
 
     text_encoder = flava_text_encoder(
@@ -422,6 +487,7 @@ def flava_model(
         pad_token_id=pad_token_id,
         type_vocab_size=type_vocab_size,
         max_position_embeddings=max_position_embeddings,
+        checkpoint_activations=checkpoint_activations,
     )
     mm_encoder = flava_multimodal_encoder(
         hidden_size=multimodal_hidden_size,
@@ -432,10 +498,14 @@ def flava_model(
         intermediate_activation=multimodal_intermediate_activation,
         attention_probs_dropout_prob=multimodal_attention_probs_dropout_prob,
         layer_norm_eps=multimodal_layer_norm_eps,
+        checkpoint_activations=checkpoint_activations,
     )
 
     image_to_mm_projection = nn.Linear(image_hidden_size, multimodal_hidden_size)
     text_to_mm_projection = nn.Linear(text_hidden_size, multimodal_hidden_size)
+
+    image_projection = nn.Linear(image_hidden_size, text_and_image_proj_size)
+    text_projection = nn.Linear(text_hidden_size, text_and_image_proj_size)
 
     return FLAVAModel(
         image_encoder=image_encoder,
@@ -443,6 +513,8 @@ def flava_model(
         mm_encoder=mm_encoder,
         image_to_mm_projection=image_to_mm_projection,
         text_to_mm_projection=text_to_mm_projection,
+        text_projection=text_projection,
+        image_projection=image_projection,
     )
 
 
@@ -453,9 +525,9 @@ def flava_model_for_pretraining(
     # TODO: Add parameters for loss here
 ) -> FLAVAForPreTraining:
     model = flava_model(**flava_model_kwargs)
-
+    hidden_size = flava_model_kwargs.get("multimodal_hidden_size", 768)
+    losses = FLAVAPretrainingLoss(hidden_size=hidden_size)
     codebook = DalleVAEEncoder(image_size=codebook_image_size)
-    losses = FLAVAPretrainingLoss()
 
     flava = FLAVAForPreTraining(
         model=model,
@@ -480,7 +552,7 @@ def flava_model_for_classification(
     pretrained_model_key: Optional[str] = "flava_full",
     **flava_model_kwargs: Any,
 ) -> FLAVAForClassification:
-    model = flava_model(**flava_model_kwargs)
+
     classifier = MLP(
         in_dim=classifier_in_dim,
         out_dim=num_classes,
@@ -489,7 +561,7 @@ def flava_model_for_classification(
         activation=classifier_activation,
         normalization=classifier_normalization,
     )
-
+    model = flava_model(**flava_model_kwargs)
     if loss_fn is None:
         loss_fn = nn.CrossEntropyLoss()
 

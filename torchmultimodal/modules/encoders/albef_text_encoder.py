@@ -4,15 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Callable, Optional
+from typing import Callable
 
 import torch
 from torch import nn, Tensor
-from torchmultimodal.modules.layers.attention import scaled_dot_product_attention
-from torchmultimodal.utils.common import (
-    get_extended_attention_mask,
-    transpose_for_scores,
-)
+from torchmultimodal.modules.layers.transformer import TransformerEncoderLayer
+from torchmultimodal.utils.attention import get_extended_attention_mask
 
 
 class ALBEFTextEncoder(nn.Module):
@@ -51,7 +48,7 @@ class ALBEFTextEncoder(nn.Module):
         type_vocab_size: int = 2,
         pad_token_id: int = 0,
         layer_norm_eps: float = 1e-12,
-        transform_act_fn: Callable[[Tensor], Tensor] = nn.functional.gelu,
+        transform_act_fn: Callable[..., nn.Module] = nn.GELU,
     ) -> None:
         super().__init__()
 
@@ -126,17 +123,17 @@ class ALBEFTransformerEncoder(nn.Module):
         num_attention_heads: int,
         num_hidden_layers: int,
         layer_norm_eps: float,
-        transform_act_fn: Callable[[Tensor], Tensor],
+        transform_act_fn: Callable[..., nn.Module],
     ) -> None:
         super().__init__()
         self.layer = nn.ModuleList(
             [
-                ALBEFTransformerLayer(
-                    hidden_size,
-                    intermediate_size,
-                    num_attention_heads,
-                    layer_norm_eps,
-                    transform_act_fn,
+                TransformerEncoderLayer(
+                    d_model=hidden_size,
+                    n_head=num_attention_heads,
+                    dim_feedforward=intermediate_size,
+                    activation=transform_act_fn,
+                    layer_norm_eps=layer_norm_eps,
                 )
                 for _ in range(num_hidden_layers)
             ]
@@ -148,124 +145,5 @@ class ALBEFTransformerEncoder(nn.Module):
         attention_mask: Tensor,
     ) -> Tensor:
         for layer_module in self.layer:
-            hidden_states = layer_module(hidden_states, attention_mask)
+            hidden_states = layer_module(hidden_states, attention_mask=attention_mask)
         return hidden_states
-
-
-class ALBEFTransformerLayer(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        num_attention_heads: int,
-        layer_norm_eps: float,
-        transform_act_fn: Callable[[Tensor], Tensor],
-    ) -> None:
-        super().__init__()
-        self.attention = ALBEFTransformerAttention(
-            hidden_size, num_attention_heads, layer_norm_eps
-        )
-        self.dense1 = nn.Linear(hidden_size, intermediate_size)
-        self.transform_act_fn = transform_act_fn
-        self.dense2 = nn.Linear(intermediate_size, hidden_size)
-        self.layer_norm = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
-
-    def forward(
-        self,
-        hidden_states: Tensor,
-        attention_mask: Tensor,
-    ) -> Tensor:
-        attention_output = self.attention(hidden_states, attention_mask)
-        dense1_output = self.dense1(attention_output)
-        act_output = self.transform_act_fn(dense1_output)
-        dense2_output = self.dense2(act_output)
-        norm_output = self.layer_norm(dense2_output + attention_output)
-        return norm_output
-
-
-class ALBEFTransformerAttention(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        num_attention_heads: int,
-        layer_norm_eps: float,
-    ) -> None:
-        super().__init__()
-        self.self_attention = ALBEFTransformerSelfAttention(
-            hidden_size, num_attention_heads
-        )
-        self.dense = nn.Linear(hidden_size, hidden_size)
-        self.layer_norm = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
-
-    def forward(
-        self,
-        hidden_states: Tensor,
-        attention_mask: Tensor,
-        encoder_hidden_states: Optional[Tensor] = None,
-    ) -> Tensor:
-        self_output = self.self_attention(
-            hidden_states, attention_mask, encoder_hidden_states
-        )
-        dense_output = self.dense(self_output)
-        attention_output = self.layer_norm(dense_output + hidden_states)
-        return attention_output
-
-
-class ALBEFTransformerSelfAttention(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        num_attention_heads: int,
-    ) -> None:
-        super().__init__()
-        if hidden_size % num_attention_heads != 0:
-            raise ValueError(
-                "The hidden size (%d) is not a multiple of the number of attention "
-                "heads (%d)" % (hidden_size, num_attention_heads)
-            )
-
-        self.num_attention_heads = num_attention_heads
-        self.attention_head_size = int(hidden_size / num_attention_heads)
-        self.all_head_size = self.num_attention_heads * self.attention_head_size
-
-        self.query = nn.Linear(hidden_size, self.all_head_size)
-        self.key = nn.Linear(hidden_size, self.all_head_size)
-        self.value = nn.Linear(hidden_size, self.all_head_size)
-
-    def forward(
-        self,
-        hidden_states: Tensor,
-        attention_mask: Tensor,
-        encoder_hidden_states: Optional[Tensor] = None,
-    ) -> Tensor:
-        mixed_query_layer = self.query(hidden_states)
-
-        # If encoder_hidden_states is not passed, then compute the self attention on hidden_states
-        # Otherwise, compute the cross attention on hidden_states and encoder_hidden_states
-        if encoder_hidden_states is None:
-            mixed_key_layer = self.key(hidden_states)
-            mixed_value_layer = self.value(hidden_states)
-        else:
-            mixed_key_layer = self.key(encoder_hidden_states)
-            mixed_value_layer = self.value(encoder_hidden_states)
-            attention_mask = None
-
-        query_layer = transpose_for_scores(
-            self.num_attention_heads, self.attention_head_size, mixed_query_layer
-        )
-        key_layer = transpose_for_scores(
-            self.num_attention_heads, self.attention_head_size, mixed_key_layer
-        )
-        value_layer = transpose_for_scores(
-            self.num_attention_heads, self.attention_head_size, mixed_value_layer
-        )
-
-        context_layer, _ = scaled_dot_product_attention(
-            query_layer, key_layer, value_layer, attention_mask
-        )
-
-        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
-        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
-        context_layer = context_layer.view(*new_context_layer_shape)
-
-        return context_layer

@@ -239,12 +239,13 @@ def flava_image_encoder(
     use_image_masking: bool = False,
     hidden_dropout_prob: float = 0.0,
     intermediate_size: int = 3072,
-    intermediate_activation: Callable[..., Tensor] = nn.functional.gelu,
+    intermediate_activation: Callable[..., nn.Module] = nn.GELU,
     attention_probs_dropout_prob: float = 0.0,
     layer_norm_eps: float = 1e-12,
     image_size: int = 224,
     patch_size: int = 16,
     num_channels: int = 3,
+    checkpoint_activations: bool = False,
 ) -> ImageTransformer:
 
     embeddings = ImageEmbeddings(
@@ -264,6 +265,7 @@ def flava_image_encoder(
         intermediate_activation=intermediate_activation,
         attention_probs_dropout_prob=attention_probs_dropout_prob,
         layer_norm_eps=layer_norm_eps,
+        checkpoint_activations=checkpoint_activations,
     )
 
     layernorm = Fp32LayerNorm(hidden_size, eps=layer_norm_eps)
