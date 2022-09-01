@@ -24,6 +24,10 @@ from flava.data import (
     VLDataModule,
 )
 from flava.definitions import FLAVAArguments
+from torchmultimodal.models.flava.flava_model import (
+    DalleVAEEncoder,
+    DalleEncoderBlock,
+)
 from flava.native.model import FLAVAPreTrainModule, get_optimizer
 from flava.native.utils import (
     build_config,
@@ -54,6 +58,16 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from torchmultimodal.modules.layers.transformer import TransformerEncoderLayer
+
+#from torchmultimodal.modules.layers.transformer import FLAVATransformerLayer
+from torchmultimodal.models.flava.flava_image_encoder import (
+    ImageEmbeddings,
+    ImageTransformer,
+)
+from torchmultimodal.models.flava.flava_text_encoder import (
+    TextEmbeddings,
+    TextTransformer,
+)
 from torchmultimodal.modules.losses.flava import FLAVAPretrainingLossOutput
 
 
@@ -132,9 +146,13 @@ class Trainer:
             self._logger.add_scalar(name, value, self.steps)
 
     def create_model(self) -> torch.nn.Module:
+        print("starting to create model")
+        import time
+        s = time.time()
         model = FLAVAPreTrainModule(
             **self.config.get("model", {}),
         )
+        print(f"created model in {time.time() - s} seconds")
         strategy = self.config.training.strategy
 
         print0(
@@ -162,13 +180,23 @@ class Trainer:
                     reduce_dtype=self.half_dtype,
                     # buffer_dtype=self.half_dtype,
                 )
-
+            wrapper_cls = {
+                    TransformerEncoderLayer,
+#                    FLAVATransformerLayer,
+                    ImageTransformer,
+                    TextTransformer,
+                    DalleVAEEncoder,
+                    DalleEncoderBlock,
+                    #MaskedPredictionLoss,
+                    }
+            wrapper_cls = {TransformerEncoderLayer}
+            #wrapper_cls = {TransformerEncoderLayer, ImageTransformer, TextTransformer}
             model = FSDP(
                 model,
                 mixed_precision=mp,
                 auto_wrap_policy=partial(
                     transformer_auto_wrap_policy,
-                    transformer_layer_cls={TransformerEncoderLayer},
+                    transformer_layer_cls=wrapper_cls,
                 ),
             )
 
